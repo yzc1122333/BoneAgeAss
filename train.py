@@ -302,13 +302,156 @@ def test_fn(net, test_loader, device):
 
 
 def reduce_fn(vals):
-    return sum(vals)import torchvision
+    return sum(vals)
+import torchvision
 from torchvision import datasets
 import torchvision.transforms as transforms
 import torch_xla.distributed.parallel_loader as pl
 import time
 
+
+
 def map_fn(index, flags):
+
+  ## Setup
+  root = '/content/drive/My Drive/BAA'
+  model_name = 'rsa50_4.48' 
+  path = f'{root}/{model_name}'
+
+  if xm.is_master_ordinal():
+    if not os.path.exists(path):
+        os.mkdir(path)
+        
+  # Sets a common random seed - both for initialization and ensuring graph is the same
+  seed_everything(seed=flags['seed'])
+
+  # Acquires the (unique) Cloud TPU core corresponding to this process's index
+  device = xm.xla_device()
+
+
+#   mymodel = BAA_base(32)
+  mymodel = BAA_New(32, *get_My_resnet50())
+#   mymodel.load_state_dict(torch.load('/content/drive/My Drive/BAA/resnet50_pr_2/best_resnet50_pr_2.bin'))
+  mymodel = mymodel.to(device)
+  
+  # Creates the (distributed) train sampler, which let this process only access
+  # its portion of the training dataset.
+  train_sampler = torch.utils.data.distributed.DistributedSampler(
+    train_set,
+    num_replicas=xm.xrt_world_size(),
+    rank=xm.get_ordinal(),
+    shuffle=True)
+  
+  val_sampler = torch.utils.data.distributed.DistributedSampler(
+    val_set,
+    num_replicas=xm.xrt_world_size(),
+    rank=xm.get_ordinal(),
+    shuffle=False)
+  
+  test_sampler = torch.utils.data.distributed.DistributedSampler(
+    test_set,
+    num_replicas=xm.xrt_world_size(),
+    rank=xm.get_ordinal(),
+    shuffle=False)
+  
+  # Creates dataloaders, which load data in batches
+  # Note: test loader is not shuffled or sampled
+  train_loader = torch.utils.data.DataLoader(
+      train_set,
+      batch_size=flags['batch_size'],
+      sampler=train_sampler,
+      num_workers=flags['num_workers'],
+      drop_last=True)
+
+  val_loader = torch.utils.data.DataLoader(
+      val_set,
+      batch_size=flags['batch_size'],
+      sampler=val_sampler,
+      shuffle=False,
+      num_workers=flags['num_workers'])
+  
+  test_loader = torch.utils.data.DataLoader(
+      test_set,
+      batch_size=flags['batch_size'],
+      sampler=test_sampler,
+      shuffle=False,
+      num_workers=flags['num_workers'])  
+
+  ## Network, optimizer, and loss function creation
+
+  # Creates AlexNet for 10 classes
+  # Note: each process has its own identical copy of the model
+  #  Even though each model is created independently, they're also
+  #  created in the same way.
+  net = mymodel.train()
+
+  global best_loss 
+  best_loss = float('inf')
+#   loss_fn =  nn.MSELoss(reduction = 'sum')
+  loss_fn = nn.L1Loss(reduction = 'sum')
+  lr = flags['lr']
+
+  wd = 0
+    
+  optimizer = torch.optim.Adam(mymodel.parameters(), lr=lr, weight_decay=wd)
+#   optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay = wd)
+  scheduler = StepLR(optimizer, step_size=10, gamma=0.5)
+
+  ## Trains
+  train_start = time.time()
+  for epoch in range(flags['num_epochs']):
+    global training_loss 
+    training_loss = torch.tensor([0], dtype = torch.float32)
+    global total_size 
+    total_size = torch.tensor([0], dtype = torch.float32)
+
+    global mae_loss 
+    mae_loss = torch.tensor([0], dtype = torch.float32)
+    global val_total_size 
+    val_total_size = torch.tensor([0], dtype = torch.float32)
+
+    global test_mae_loss 
+    test_mae_loss = torch.tensor([0], dtype = torch.float32)
+    global test_total_size 
+    test_total_size = torch.tensor([0], dtype = torch.float32)
+    # xm.rendezvous("initialization")
+
+    start_time = time.time()
+    para_train_loader = pl.ParallelLoader(train_loader, [device]).per_device_loader(device)
+    train_fn(net, para_train_loader, loss_fn, epoch, optimizer, device)
+    
+    ## Evaluation
+    # Sets net to eval and no grad context
+    para_val_loader = pl.ParallelLoader(val_loader, [device]).per_device_loader(device)
+    evaluate_fn(net, para_val_loader, device)
+
+    para_test_loader = pl.ParallelLoader(test_loader, [device]).per_device_loader(device)
+    test_fn(net, para_test_loader, device)
+
+    scheduler.step()
+    
+    xm.save(net.state_dict(), '/'.join([path, f'{model_name}.bin']))  
+    training_loss = xm.mesh_reduce('training_loss',training_loss,reduce_fn)
+    total_size = xm.mesh_reduce('total_size_reduce',total_size,reduce_fn)
+    mae_loss = xm.mesh_reduce('mae_loss_reduce',mae_loss,reduce_fn)
+    val_total_size = xm.mesh_reduce('val_total_size_reduce',val_total_size,reduce_fn)
+    test_mae_loss = xm.mesh_reduce('test_mae_loss_reduce',test_mae_loss,reduce_fn)
+    test_total_size = xm.mesh_reduce('test_total_size_reduce',test_total_size,reduce_fn)
+
+    if xm.is_master_ordinal():
+        print(test_total_size)
+        train_loss, val_mae, test_mae = training_loss/total_size, mae_loss/val_total_size, test_mae_loss/test_total_size
+        print(f'training loss is {train_loss}, val loss is {val_mae}, test loss is {test_mae}, time : {time.time() - start_time}, lr:{optimizer.param_groups[0]["lr"]}')
+
+
+    if xm.is_master_ordinal() and best_loss >= test_mae:
+        best_loss = test_mae
+        shutil.copy(f'{path}/{model_name}.bin', \
+                    f'{path}/best_{model_name}.bin')
+
+
+
+def map_ensemble_fn(index, flags):
 
   ## Setup
   root = '/content/drive/My Drive/BAA'
@@ -449,21 +592,40 @@ def map_fn(index, flags):
 
 
 if __name__ == "__main__":
-    from model import Ensemble, Graph_BAA, BAA_New
+    from model import Ensemble, Graph_BAA, BAA_New, get_My_resnet50, BAA_Base
+    import argparse
     
-    new_model = Graph_BAA(model)
-    new_model.load_state_dict(torch.load('/content/drive/MyDrive/BAA/GMRSA_ensemble_3.93/GMRSA_50_4.01.bin'))
-    ensemble = Ensemble(new_model)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('model_type')
+    parser.add_argument('lr', type=float)
+    parser.add_argument('batch_size', type = int)
+    parser.add_argument('num_epochs', type = int)
+    parser.add_argument('seed', type = int)
+    args = parser.parse_args()
+
+    if args.model_type == 'ensemble':
+        model = BAA_New(32, *get_My_resnet50())
+        model.load_state_dict(torch.load('/content/drive/MyDrive/BAA/MRSA_50++_4.03/best_MRSA_50++_4.03.bin'))
+        new_model = Graph_BAA(model)
+        ensemble = Ensemble(new_model)
+    else:
+        model = BAA_New(32, *get_My_resnet50())
 
     flags = {}
-    flags['lr'] = 5e-4
-    flags['batch_size'] = 32
+    flags['lr'] = args.lr
+    flags['batch_size'] = args.batch_size
     flags['num_workers'] = 2
-    flags['num_epochs'] = 100
-    flags['seed'] = 1
+    flags['num_epochs'] = args.num_epochs
+    flags['seed'] = args.seed
 
+    train_df = pd.read_csv(f'/content/drive/My Drive/BAA/train.csv')
+    val_df = pd.read_csv(f'/content/drive/My Drive/BAA/Validation Dataset.csv')
+    test_df = pd.read_excel('/content/drive/My Drive/BAA/Bone age ground truth.xlsx')
+    boneage_mean = train_df['boneage'].mean()
+    boneage_div = train_df['boneage'].std()
+    train_set, val_set, test_set = create_data_loader(train_df, val_df, test_df, '/content/drive/My Drive/BAA/boneage-training-dataset', '/content/drive/My Drive/BAA/boneage-validation-dataset', '/content/drive/My Drive/BAA/Test Set Images')
     torch.set_default_tensor_type('torch.FloatTensor')
-    xmp.spawn(map_fn, args=(flags,), nprocs=8, start_method='fork')
-
-
-
+    if args.model_type == 'ensemble':
+        xmp.spawn(map_ensemble_fn, args=(flags,), nprocs=8, start_method='fork')
+    else:
+        xmp.spawn(map_fn, args=(flags,), nprocs=8, start_method='fork')
